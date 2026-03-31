@@ -159,12 +159,11 @@ class DepthAnything3Net(nn.Module):
         if "sky" not in output:
             return output
         non_sky_mask = compute_sky_mask(output.sky, threshold=0.3)
-        if non_sky_mask.sum() <= 10:
-            return output
-        if (~non_sky_mask).sum() <= 10:
-            return output
-        
         non_sky_depth = output.depth[non_sky_mask]
+        sky_depth = output.depth[~non_sky_mask]
+        if non_sky_depth.numel() <= 10 or sky_depth.numel() <= 10:
+            return output
+
         if non_sky_depth.numel() > 100000:
             idx = torch.randint(0, non_sky_depth.numel(), (100000,), device=non_sky_depth.device)
             sampled_depth = non_sky_depth[idx]
@@ -389,11 +388,10 @@ class NestedDepthAnything3Net(nn.Module):
         # Compute non-sky mask
         non_sky_mask = compute_sky_mask(metric_output.sky, threshold=0.3)
 
-        # Ensure we have enough non-sky pixels
-        assert non_sky_mask.sum() > 10, "Insufficient non-sky pixels for alignment"
-
         # Sample depth confidence for quantile computation
         depth_conf_ns = output.depth_conf[non_sky_mask]
+        if depth_conf_ns.numel() <= 10:
+            raise RuntimeError("Insufficient non-sky pixels for alignment")
         depth_conf_sampled = sample_tensor_for_quantile(depth_conf_ns, max_samples=100000)
         median_conf = torch.quantile(depth_conf_sampled, 0.5)
 
@@ -411,7 +409,7 @@ class NestedDepthAnything3Net(nn.Module):
         output.depth *= scale_factor
         output.extrinsics[:, :, :3, 3] *= scale_factor
         output.is_metric = 1
-        output.scale_factor = scale_factor.item()
+        output.scale_factor = scale_factor.detach()
 
         return output
 
@@ -432,7 +430,8 @@ class NestedDepthAnything3Net(nn.Module):
             sampled_depth = non_sky_depth[idx]
         else:
             sampled_depth = non_sky_depth
-        non_sky_max = min(torch.quantile(sampled_depth, 0.99), sky_depth_def)
+        sky_depth_limit = sampled_depth.new_tensor(sky_depth_def)
+        non_sky_max = torch.minimum(torch.quantile(sampled_depth, 0.99), sky_depth_limit)
 
         # Set sky regions to maximum depth and high confidence
         output.depth, output.depth_conf = set_sky_regions_to_max_depth(
