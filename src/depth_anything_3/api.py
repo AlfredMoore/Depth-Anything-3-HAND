@@ -25,6 +25,8 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as T
 from huggingface_hub import PyTorchModelHubMixin
 from PIL import Image
 
@@ -92,6 +94,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         # Initialize processors
         self.input_processor = InputProcessor()
         self.output_processor = OutputProcessor()
+        self._normalize_torch = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         # Device management (set by user)
         self.device = None
@@ -272,6 +275,77 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         return prediction
 
+    @torch.inference_mode()
+    def inference_torch(
+        self,
+        image: torch.Tensor,
+        extrinsics: torch.Tensor | None = None,
+        intrinsics: torch.Tensor | None = None,
+        process_res: int = 504,
+        process_res_method: str = "upper_bound_resize",
+        export_feat_layers: Sequence[int] | None = None,
+        infer_gs: bool = False,
+        use_ray_pose: bool = False,
+        ref_view_strategy: str = "saddle_balanced",
+    ) -> dict[str, torch.Tensor]:
+        """
+        GPU-only torch inference path that keeps tensors on device.
+
+        Args:
+            image: Input tensor in RGB with shape (N, H, W, C) or (N, C, H, W).
+                   C can be 3 or 4 (alpha channel is ignored). Integer inputs are
+                   treated as [0, 255]; floating inputs are assumed to be [0, 1].
+            extrinsics: Optional camera extrinsics with shape (N, 4, 4).
+            intrinsics: Optional camera intrinsics with shape (N, 3, 3).
+            process_res: Processing resolution.
+            process_res_method: One of:
+                "upper_bound_resize", "upper_bound_crop",
+                "lower_bound_resize", "lower_bound_crop".
+            export_feat_layers: Optional feature layers for model forward.
+            infer_gs: Enable Gaussian Splatting branch.
+            use_ray_pose: Use ray-based pose estimation.
+            ref_view_strategy: Reference view selection strategy.
+
+        Returns:
+            A dictionary of torch tensors where the leading batch dimension is removed:
+                - "depth": (N, H', W') at minimum
+                - optional model outputs such as "depth_conf", "sky", "extrinsics", "intrinsics"
+        """
+        model_device = self._get_model_device()
+        if model_device.type != "cuda":
+            raise RuntimeError(
+                "inference_torch is GPU-only. Move model to CUDA first, e.g. model.to('cuda')."
+            )
+
+        # Keep API compatibility for extrinsics but ignore it in this training-oriented path for now.
+        extrinsics = None
+
+        imgs, ex_t, in_t = self._preprocess_inputs_torch(
+            image=image,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            process_res=process_res,
+            process_res_method=process_res_method,
+            device=model_device,
+        )
+
+        imgs = imgs[None]  # (1, N, 3, H', W')
+        ex_t = ex_t[None] if ex_t is not None else None
+        in_t = in_t[None] if in_t is not None else None
+        feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
+
+        raw_output = self.forward(
+            imgs,
+            ex_t,
+            in_t,
+            feat_layers,
+            infer_gs,
+            use_ray_pose,
+            ref_view_strategy,
+        )
+
+        return self._postprocess_model_output_torch(raw_output)
+
     def _preprocess_inputs(
         self,
         image: list[np.ndarray | Image.Image | str],
@@ -297,6 +371,200 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             imgs_cpu.shape,
         )
         return imgs_cpu, extrinsics, intrinsics
+
+    def _preprocess_inputs_torch(
+        self,
+        image: torch.Tensor,
+        extrinsics: torch.Tensor | None,
+        intrinsics: torch.Tensor | None,
+        process_res: int,
+        process_res_method: str,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Torch/GPU preprocessing for same-shape batched images."""
+        if not isinstance(image, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor for image, got {type(image)}.")
+        if image.dim() != 4:
+            raise ValueError(
+                "Expected image with shape (N,H,W,C) or (N,C,H,W), "
+                f"got {tuple(image.shape)}."
+            )
+        if process_res <= 0:
+            raise ValueError(f"process_res must be positive, got {process_res}.")
+
+        imgs = image.to(device=device, non_blocking=True)
+        imgs = self._to_nchw_rgb(imgs)
+        imgs = imgs.float()
+        if not torch.is_floating_point(image):
+            imgs = imgs / 255.0
+
+        n, _, orig_h, orig_w = imgs.shape
+        ex_t, in_t = self._validate_camera_tensors(extrinsics, intrinsics, n, device)
+
+        resized_h, resized_w = self._compute_boundary_resize_shape(
+            orig_h, orig_w, process_res, process_res_method
+        )
+        if resized_h != orig_h or resized_w != orig_w:
+            imgs = self._resize_images(imgs, resized_h, resized_w)
+            in_t = self._resize_intrinsics(in_t, orig_w, orig_h, resized_w, resized_h)
+
+        if process_res_method.endswith("resize"):
+            div_h = self._nearest_multiple(resized_h, self.input_processor.PATCH_SIZE)
+            div_w = self._nearest_multiple(resized_w, self.input_processor.PATCH_SIZE)
+            div_h = max(1, div_h)
+            div_w = max(1, div_w)
+            if div_h != resized_h or div_w != resized_w:
+                imgs = self._resize_images(imgs, div_h, div_w)
+                in_t = self._resize_intrinsics(in_t, resized_w, resized_h, div_w, div_h)
+        elif process_res_method.endswith("crop"):
+            patch = self.input_processor.PATCH_SIZE
+            div_h = (resized_h // patch) * patch
+            div_w = (resized_w // patch) * patch
+            if div_h <= 0 or div_w <= 0:
+                raise ValueError(
+                    f"Image size too small for patch size {patch}: {(resized_h, resized_w)}."
+                )
+            if div_h != resized_h or div_w != resized_w:
+                crop_top = (resized_h - div_h) // 2
+                crop_left = (resized_w - div_w) // 2
+                imgs = imgs[:, :, crop_top : crop_top + div_h, crop_left : crop_left + div_w]
+                in_t = self._crop_intrinsics(in_t, crop_left, crop_top)
+        else:
+            raise ValueError(f"Unsupported process_res_method: {process_res_method}")
+
+        imgs = self._normalize_torch(imgs)
+
+        return imgs.contiguous(), ex_t, in_t
+
+    def _postprocess_model_output_torch(
+        self, model_output: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Normalize known tensor outputs without applying broad shape assumptions."""
+        out: dict[str, torch.Tensor] = {}
+        batch_squeeze_keys = {"depth", "depth_conf", "sky", "extrinsics", "intrinsics"}
+        map_like_keys = {"depth", "depth_conf", "sky"}
+        for key, value in model_output.items():
+            if isinstance(value, torch.Tensor):
+                tensor = value
+                if key in batch_squeeze_keys and tensor.dim() > 0 and tensor.shape[0] == 1:
+                    tensor = tensor.squeeze(0)
+                if key in map_like_keys:
+                    if tensor.dim() == 4 and tensor.shape[-1] == 1:
+                        tensor = tensor.squeeze(-1)
+                    if tensor.dim() == 4 and tensor.shape[1] == 1:
+                        tensor = tensor.squeeze(1)
+                out[key] = tensor
+        return out
+
+    def _to_nchw_rgb(self, image: torch.Tensor) -> torch.Tensor:
+        """Convert image tensor to RGB NCHW."""
+        if image.shape[-1] in (3, 4):
+            # NHWC -> NCHW
+            image = image.permute(0, 3, 1, 2)
+        elif image.shape[1] not in (3, 4):
+            raise ValueError(
+                "Expected channels in last dim (3/4) or second dim (3/4), "
+                f"got shape {tuple(image.shape)}."
+            )
+
+        if image.shape[1] == 4:
+            image = image[:, :3]
+        elif image.shape[1] != 3:
+            raise ValueError(f"Expected 3-channel RGB image, got shape {tuple(image.shape)}.")
+        return image
+
+    def _validate_camera_tensors(
+        self,
+        extrinsics: torch.Tensor | None,
+        intrinsics: torch.Tensor | None,
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Validate and move optional camera tensors to target device."""
+        ex_t = None
+        if extrinsics is not None:
+            if not isinstance(extrinsics, torch.Tensor):
+                raise TypeError(f"Expected extrinsics as torch.Tensor, got {type(extrinsics)}.")
+            if extrinsics.shape != (batch_size, 4, 4):
+                raise ValueError(
+                    f"Expected extrinsics shape {(batch_size, 4, 4)}, got {tuple(extrinsics.shape)}."
+                )
+            ex_t = extrinsics.to(device=device, non_blocking=True).float()
+
+        in_t = None
+        if intrinsics is not None:
+            if not isinstance(intrinsics, torch.Tensor):
+                raise TypeError(f"Expected intrinsics as torch.Tensor, got {type(intrinsics)}.")
+            if intrinsics.shape != (batch_size, 3, 3):
+                raise ValueError(
+                    f"Expected intrinsics shape {(batch_size, 3, 3)}, got {tuple(intrinsics.shape)}."
+                )
+            in_t = intrinsics.to(device=device, non_blocking=True).float()
+
+        return ex_t, in_t
+
+    def _compute_boundary_resize_shape(
+        self, height: int, width: int, process_res: int, process_res_method: str
+    ) -> tuple[int, int]:
+        """Compute resized image shape based on process_res_method."""
+        if process_res_method.startswith("upper_bound_"):
+            denom = max(height, width)
+        elif process_res_method.startswith("lower_bound_"):
+            denom = min(height, width)
+        else:
+            raise ValueError(f"Unsupported process_res_method: {process_res_method}")
+
+        if denom <= 0:
+            raise ValueError(f"Invalid image shape {(height, width)}.")
+
+        scale = process_res / float(denom)
+        new_h = max(1, int(round(height * scale)))
+        new_w = max(1, int(round(width * scale)))
+        return new_h, new_w
+
+    def _resize_images(self, imgs: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+        """Resize image batch with interpolation matching CPU path intent."""
+        in_h, in_w = imgs.shape[-2], imgs.shape[-1]
+        upscale = out_h > in_h or out_w > in_w
+        if upscale:
+            return F.interpolate(
+                imgs, size=(out_h, out_w), mode="bicubic", align_corners=False
+            )
+        return F.interpolate(imgs, size=(out_h, out_w), mode="area")
+
+    def _resize_intrinsics(
+        self,
+        intrinsics: torch.Tensor | None,
+        in_w: int,
+        in_h: int,
+        out_w: int,
+        out_h: int,
+    ) -> torch.Tensor | None:
+        """Apply resize transform to intrinsics as done in InputProcessor._resize_ixt."""
+        if intrinsics is None:
+            return None
+        k = intrinsics.clone()
+        k[:, 0, :] *= out_w / float(in_w)
+        k[:, 1, :] *= out_h / float(in_h)
+        return k
+
+    def _crop_intrinsics(
+        self, intrinsics: torch.Tensor | None, crop_left: int, crop_top: int
+    ) -> torch.Tensor | None:
+        """Apply center-crop transform to intrinsics as done in InputProcessor._crop_ixt."""
+        if intrinsics is None:
+            return None
+        k = intrinsics.clone()
+        k[:, 0, 2] -= crop_left
+        k[:, 1, 2] -= crop_top
+        return k
+
+    @staticmethod
+    def _nearest_multiple(value: int, patch: int) -> int:
+        """Round to nearest patch multiple (ties round up), matching InputProcessor logic."""
+        down = (value // patch) * patch
+        up = down + patch
+        return up if abs(up - value) <= abs(value - down) else down
 
     def _prepare_model_inputs(
         self,
