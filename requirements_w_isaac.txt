@@ -1,0 +1,28 @@
+# --- Core Frameworks (Pinned to prevent overwriting) ---
+# Pre-installed versions are locked to ensure compatibility with SAM3
+torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
+numpy==1.26.4
+
+pre-commit
+trimesh
+einops
+huggingface_hub
+imageio
+opencv-python
+xformers
+open3d
+fastapi
+uvicorn
+requests
+typer
+pillow
+omegaconf
+evo
+moviepy
+plyfile
+pillow_heif
+safetensors
+pycolmap
+e3nn

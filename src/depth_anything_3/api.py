@@ -307,7 +307,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             ref_view_strategy: Reference view selection strategy.
 
         Returns:
-            A dictionary of torch tensors where the leading batch dimension is removed:
+            A dictionary of torch tensors with singleton scene/view dimensions removed:
                 - "depth": (N, H', W') at minimum
                 - optional model outputs such as "depth_conf", "sky", "extrinsics", "intrinsics"
         """
@@ -329,9 +329,10 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             device=model_device,
         )
 
-        imgs = imgs[None]  # (1, N, 3, H', W')
-        ex_t = ex_t[None] if ex_t is not None else None
-        in_t = in_t[None] if in_t is not None else None
+        # Use B=N, S=1 so each sample is treated as an independent single-view scene.
+        imgs = imgs[:, None]  # (N, 1, 3, H', W')
+        ex_t = ex_t[:, None] if ex_t is not None else None
+        in_t = in_t[:, None] if in_t is not None else None
         feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
 
         raw_output = self.forward(
@@ -446,6 +447,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         for key, value in model_output.items():
             if isinstance(value, torch.Tensor):
                 tensor = value
+                if key in batch_squeeze_keys and tensor.dim() > 1 and tensor.shape[1] == 1:
+                    tensor = tensor.squeeze(1)
                 if key in batch_squeeze_keys and tensor.dim() > 0 and tensor.shape[0] == 1:
                     tensor = tensor.squeeze(0)
                 if key in map_like_keys:
