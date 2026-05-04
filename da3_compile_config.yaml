@@ -1,0 +1,34 @@
+da3_cfg:
+  # Core DA3 runtime
+  # aux_policy / aux_policy_v2:
+  #   model <- policy_node_cfg.cv_model.da3.model (or DEFAULT_DA3_MODEL when empty)
+  model: "depth-anything/DA3-BASE"
+  device: "cuda"
+  rate: 30
+
+  # aux_policy_v2: process_res <- env_cfg["da3_process_res"]
+  # aux_policy:    process_res <- env_cfg.get("da3_process_res", 308)
+  # current runtime/env.yaml is 308
+  process_res: 308
+  process_res_method: "upper_bound_resize"
+
+  chunk_size: 1
+
+  # Camera / metric scaling
+  # aux_policy / aux_policy_v2 both compute:
+  #   focal = 0.5 * (fx + fy)
+  # from policy_node_cfg.realsense.color_intrinsics
+  focal: 616.5355529785156
+  fx: 616.4124755859375
+  fy: 616.6586303710938
+  cx: 323.9004821777344
+  cy: 243.82867431640625
+
+  # HuggingFace cache location (absolute real path)
+  cache_dir: "/workspace/models/da3"
+
+  compile:
+    enabled: true
+    backend: "inductor"
+    fullgraph: false
+    dynamic: false

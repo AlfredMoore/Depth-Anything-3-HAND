@@ -94,6 +94,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         self.input_processor = InputProcessor()
         self.output_processor = OutputProcessor()
         self._normalize_torch = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self._autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         # Device management (set by user)
         self.device = None
@@ -124,10 +125,8 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         Returns:
             Dictionary containing model predictions
         """
-        # Determine optimal autocast dtype
-        autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with torch.no_grad():
-            with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
+            with torch.autocast(device_type=image.device.type, dtype=self._autocast_dtype):
                 return self.model(
                     image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
                 )
@@ -278,6 +277,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
     def inference_torch(
         self,
         image: torch.Tensor,
+        device: torch.device | str,
         extrinsics: torch.Tensor | None = None,
         intrinsics: torch.Tensor | None = None,
         process_res: int = 504,
@@ -294,6 +294,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             image: Input tensor in RGB with shape (N, H, W, C) or (N, C, H, W).
                    C can be 3 or 4 (alpha channel is ignored). Integer inputs are
                    treated as [0, 255]; floating inputs are assumed to be [0, 1].
+            device: Target CUDA device, passed explicitly by caller.
             extrinsics: Optional camera extrinsics with shape (N, 4, 4).
             intrinsics: Optional camera intrinsics with shape (N, 3, 3).
             process_res: Processing resolution.
@@ -310,7 +311,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
                 - "depth": (N, H', W') at minimum
                 - optional model outputs such as "depth_conf", "sky", "extrinsics", "intrinsics"
         """
-        model_device = self._get_model_device()
+        model_device = torch.device(device)
         if model_device.type != "cuda":
             raise RuntimeError(
                 "inference_torch is GPU-only. Move model to CUDA first, e.g. model.to('cuda')."
