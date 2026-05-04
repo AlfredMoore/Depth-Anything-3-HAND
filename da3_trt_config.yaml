@@ -4,7 +4,8 @@ da3_cfg:
   #   model <- policy_node_cfg.cv_model.da3.model (or DEFAULT_DA3_MODEL when empty)
   model: "depth-anything/DA3-BASE"
   device: "cuda"
-
+  rate: 30
+  
   # aux_policy_v2: process_res <- env_cfg["da3_process_res"]
   # aux_policy:    process_res <- env_cfg.get("da3_process_res", 308)
   # current runtime/env.yaml is 308

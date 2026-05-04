@@ -353,6 +353,10 @@ class DA3Inference:
     def from_yaml(yaml_path: str | Path) -> "DA3Inference":
         return DA3Inference(load_da3_cfg_from_yaml(yaml_path))
 
+    @staticmethod
+    def from_dict(raw: dict[str, Any]) -> "DA3Inference":
+        return DA3Inference(DA3Config.from_dict(raw))
+
     def _sanitize_model_for_filename(self) -> str:
         return self.model_name.replace("/", "--").replace(".", "_")
 
